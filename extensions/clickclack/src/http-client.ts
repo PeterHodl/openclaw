@@ -14,24 +14,11 @@ import type {
   ClickClackEvent,
   ClickClackMessage,
   ClickClackMessageProvenance,
+  ClickClackUpload,
   ClickClackUser,
   ClickClackWorkspace,
 } from "./types.js";
 import { WebSocket } from "./ws-runtime.js";
-
-type ClickClackUpload = {
-  id: string;
-  workspace_id: string;
-  owner_id: string;
-  nonce?: string;
-  filename: string;
-  content_type: string;
-  byte_size: number;
-  width: number;
-  height: number;
-  duration_ms: number;
-  created_at: string;
-};
 
 /**
  * Serializes optional provenance into the wire fields. Unknown JSON fields
@@ -193,6 +180,23 @@ export function createClickClackClient(options: ClientOptions) {
         clearTimeout(timeout);
       }
     }
+  }
+
+  async function download(path: string): Promise<Response> {
+    const requestHeaders = new Headers(headers);
+    if (correlationId) {
+      requestHeaders.set(CLICKCLACK_CORRELATION_ID_HEADER, correlationId);
+    }
+    const response = await fetcher(`${baseUrl}${path}`, { headers: requestHeaders });
+    if (!response.ok) {
+      const detail = await readResponseTextLimited(response, CLICKCLACK_ERROR_BODY_LIMIT_BYTES);
+      throw new ClickClackHttpError(
+        response.status,
+        redactToolPayloadText(detail),
+        new Headers(response.headers),
+      );
+    }
+    return response;
   }
 
   async function fetchEventPage(
@@ -518,6 +522,8 @@ export function createClickClackClient(options: ClientOptions) {
         body: JSON.stringify({ upload_id: uploadId }),
       });
     },
+    downloadUpload: async (uploadId: string): Promise<Response> =>
+      await download(`/api/uploads/${encodeURIComponent(uploadId)}`),
     /**
      * POSTs a durable agent activity row (agent_commentary / agent_tool)
      * through the normal message create path. Requires a bot token carrying
