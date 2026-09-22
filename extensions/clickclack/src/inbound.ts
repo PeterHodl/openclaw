@@ -18,7 +18,7 @@ import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
 import { MediaFetchError, saveResponseMedia } from "openclaw/plugin-sdk/media-runtime";
 import { resolveClickClackInboundAccess, type ClickClackInboundAccess } from "./access.js";
 import { createClickClackActivityPublisher, type ClickClackActivityPublisher } from "./activity.js";
-import { createClickClackClient } from "./http-client.js";
+import { ClickClackHttpError, createClickClackClient } from "./http-client.js";
 import { sendClickClackText } from "./outbound.js";
 import {
   createClickClackAgentProgressPublisher,
@@ -38,11 +38,23 @@ const CLICKCLACK_MAX_MEDIA_BYTES = 64 * 1024 * 1024;
 const CLICKCLACK_MAX_INBOUND_ATTACHMENTS = 8;
 const CLICKCLACK_MEDIA_READ_IDLE_TIMEOUT_MS = 15_000;
 
+function isTerminalUploadError(error: unknown): boolean {
+  return (
+    error instanceof ClickClackHttpError &&
+    error.status >= 400 &&
+    error.status < 500 &&
+    error.status !== 408 &&
+    error.status !== 425 &&
+    error.status !== 429
+  );
+}
+
 async function materializeInboundMedia(params: {
   account: ResolvedClickClackAccount;
   config: CoreConfig;
   message: ClickClackMessage;
   correlationId?: string;
+  abortSignal?: AbortSignal;
 }) {
   const attachments = params.message.attachments ?? [];
   if (attachments.length === 0) {
@@ -64,14 +76,18 @@ async function materializeInboundMedia(params: {
   const mediaInputs = [];
   const notices: string[] = [];
   for (const attachment of attachments.slice(0, CLICKCLACK_MAX_INBOUND_ATTACHMENTS)) {
+    if (params.abortSignal?.aborted) {
+      return { body: params.message.body, media: [], aborted: true };
+    }
     if (attachment.byte_size > maxBytes) {
       notices.push(
         `[ClickClack attachment unavailable: ${attachment.filename} exceeds the configured media limit]`,
       );
       continue;
     }
-    const response = await client.downloadUpload(attachment.id);
+    let response: Response | undefined;
     try {
+      response = await client.downloadUpload(attachment.id, { signal: params.abortSignal });
       const saved = await saveResponseMedia(response, {
         sourceUrl: `${params.account.apiEndpoint}/api/uploads/${encodeURIComponent(attachment.id)}`,
         filePathHint: attachment.filename,
@@ -90,14 +106,23 @@ async function materializeInboundMedia(params: {
         durationMs: attachment.duration_ms,
       });
     } catch (error) {
+      if (params.abortSignal?.aborted) {
+        return { body: params.message.body, media: [], aborted: true };
+      }
       if (!(error instanceof MediaFetchError) || error.code !== "max_bytes") {
+        if (isTerminalUploadError(error)) {
+          notices.push(
+            `[ClickClack attachment unavailable: ${attachment.filename} could not be retrieved]`,
+          );
+          continue;
+        }
         throw error;
       }
       notices.push(
         `[ClickClack attachment unavailable: ${attachment.filename} exceeds the configured media limit]`,
       );
     } finally {
-      await response.body?.cancel().catch(() => undefined);
+      await response?.body?.cancel().catch(() => undefined);
     }
   }
   if (attachments.length > CLICKCLACK_MAX_INBOUND_ATTACHMENTS) {
@@ -112,6 +137,7 @@ async function materializeInboundMedia(params: {
   return {
     body,
     media: await toInboundMediaFactsWithMetadata(mediaInputs, { messageId: params.message.id }),
+    aborted: false,
   };
 }
 
@@ -274,7 +300,11 @@ export async function handleClickClackInbound(params: {
     config: params.config,
     message,
     correlationId: params.correlationId,
+    abortSignal: params.abortSignal,
   });
+  if (inbound.aborted || params.abortSignal?.aborted) {
+    return;
+  }
   // Durable activity rows (streamed commentary + tool progress) are a
   // per-account opt-in: they need a ClickClack bot token carrying the
   // agent_activity:write scope. Publishing is best-effort and must never

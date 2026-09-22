@@ -127,6 +127,7 @@ async function processEvent(params: {
     message,
     access,
     buildContext: params.buildContext,
+    abortSignal: params.abortSignal,
     ...(correlationId ? { correlationId } : {}),
   });
 }

@@ -182,21 +182,40 @@ export function createClickClackClient(options: ClientOptions) {
     }
   }
 
-  async function download(path: string): Promise<Response> {
+  async function download(
+    path: string,
+    options: { signal?: AbortSignal; timeoutMs?: number } = {},
+  ): Promise<Response> {
     const requestHeaders = new Headers(headers);
     if (correlationId) {
       requestHeaders.set(CLICKCLACK_CORRELATION_ID_HEADER, correlationId);
     }
-    const response = await fetcher(`${baseUrl}${path}`, { headers: requestHeaders });
-    if (!response.ok) {
-      const detail = await readResponseTextLimited(response, CLICKCLACK_ERROR_BODY_LIMIT_BYTES);
-      throw new ClickClackHttpError(
-        response.status,
-        redactToolPayloadText(detail),
-        new Headers(response.headers),
-      );
+    const controller = new AbortController();
+    const abort = () => controller.abort(options.signal?.reason);
+    options.signal?.addEventListener("abort", abort, { once: true });
+    const timeout = setTimeout(
+      () =>
+        controller.abort(new DOMException("ClickClack upload request timed out", "TimeoutError")),
+      options.timeoutMs ?? CLICKCLACK_EPHEMERAL_REQUEST_TIMEOUT_MS,
+    );
+    try {
+      const response = await fetcher(`${baseUrl}${path}`, {
+        headers: requestHeaders,
+        signal: controller.signal,
+      });
+      if (!response.ok) {
+        const detail = await readResponseTextLimited(response, CLICKCLACK_ERROR_BODY_LIMIT_BYTES);
+        throw new ClickClackHttpError(
+          response.status,
+          redactToolPayloadText(detail),
+          new Headers(response.headers),
+        );
+      }
+      return response;
+    } finally {
+      clearTimeout(timeout);
+      options.signal?.removeEventListener("abort", abort);
     }
-    return response;
   }
 
   async function fetchEventPage(
@@ -522,8 +541,10 @@ export function createClickClackClient(options: ClientOptions) {
         body: JSON.stringify({ upload_id: uploadId }),
       });
     },
-    downloadUpload: async (uploadId: string): Promise<Response> =>
-      await download(`/api/uploads/${encodeURIComponent(uploadId)}`),
+    downloadUpload: async (
+      uploadId: string,
+      options?: { signal?: AbortSignal; timeoutMs?: number },
+    ): Promise<Response> => await download(`/api/uploads/${encodeURIComponent(uploadId)}`, options),
     /**
      * POSTs a durable agent activity row (agent_commentary / agent_tool)
      * through the normal message create path. Requires a bot token carrying

@@ -54,6 +54,15 @@ function configureDiscussionStore(runtime: PluginRuntime): void {
     stores.set(options.namespace, created);
     return created;
   }) as unknown as PluginRuntime["state"]["openSyncKeyedStore"];
+  runtime.state.openKeyedStore = vi.fn((options: { namespace: string }) => {
+    const existing = stores.get(options.namespace);
+    if (existing) {
+      return existing;
+    }
+    const created = createStore<unknown>();
+    stores.set(options.namespace, created);
+    return created;
+  }) as unknown as PluginRuntime["state"]["openKeyedStore"];
 }
 
 function createRuntime(): PluginRuntime {
@@ -189,6 +198,10 @@ describe("ClickClack inbound media", () => {
       }),
     );
     const ctxPayload = vi.mocked(runtime.channel.inbound.dispatch).mock.calls[0]?.[0].ctxPayload;
+    expect(ctxPayload).toBeDefined();
+    if (!ctxPayload) {
+      throw new Error("expected inbound dispatch context");
+    }
     expect(ctxPayload.BodyForAgent).toBe(messageBody);
     expect(ctxPayload.media).toEqual([
       expect.objectContaining({
@@ -201,5 +214,58 @@ describe("ClickClack inbound media", () => {
         height: 480,
       }),
     ]);
+  });
+
+  it("keeps the turn dispatchable when an upload is permanently unavailable", async () => {
+    const runtime = createRuntime();
+    setClickClackRuntime(runtime);
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => new Response("not found", { status: 404 })),
+    );
+
+    await handleClickClackInbound({
+      account: createAccount(),
+      config: {},
+      message: createMessage("describe it"),
+    });
+
+    const ctxPayload = vi.mocked(runtime.channel.inbound.dispatch).mock.calls[0]?.[0].ctxPayload;
+    expect(ctxPayload).toBeDefined();
+    if (!ctxPayload) {
+      throw new Error("expected inbound dispatch context");
+    }
+    expect(ctxPayload.BodyForAgent).toContain("diagram.png could not be retrieved");
+    expect(ctxPayload.media).toEqual([]);
+  });
+
+  it("does not dispatch after attachment staging is cancelled", async () => {
+    const runtime = createRuntime();
+    setClickClackRuntime(runtime);
+    const controller = new AbortController();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+        controller.abort();
+        return await new Promise<Response>((_resolve, reject) => {
+          if (init?.signal?.aborted) {
+            reject(init.signal.reason);
+            return;
+          }
+          init?.signal?.addEventListener("abort", () => reject(init.signal?.reason), {
+            once: true,
+          });
+        });
+      }),
+    );
+
+    await handleClickClackInbound({
+      account: createAccount(),
+      config: {},
+      message: createMessage("describe it"),
+      abortSignal: controller.signal,
+    });
+
+    expect(runtime.channel.inbound.dispatch).not.toHaveBeenCalled();
   });
 });
